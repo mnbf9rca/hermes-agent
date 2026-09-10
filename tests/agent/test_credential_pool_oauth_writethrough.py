@@ -3,7 +3,7 @@
 Companion to ``tests/hermes_cli/test_xai_oauth_writethrough.py``. That file
 covers the *non-pool* xAI refresh path (``_save_xai_oauth_tokens``). These
 cover the **credential-pool** refresh path
-(``CredentialPool._sync_device_code_entry_to_auth_store``): when a profile
+(``CredentialPool._refresh_entry``): when a profile
 that has no own ``providers.<id>`` block refreshes — via the pool — a rotating
 OAuth grant it resolved from the global-root fallback, the rotated chain must
 be written back to the global root too. Otherwise root keeps a revoked refresh
@@ -11,7 +11,7 @@ token and every other profile reading root's stale grant dies with
 ``refresh_token_reused`` / ``invalid_grant`` once its access token expires
 (issue #48415, the Codex/xAI analog of #43589).
 
-The tests drive the real ``_sync_device_code_entry_to_auth_store`` against
+The tests drive the real ``_refresh_entry`` against
 real on-disk auth stores (profile + root under ``tmp_path``) rather than
 mocking the save boundary, so they exercise the actual atomic write path.
 """
@@ -59,7 +59,7 @@ def _entry(provider: str, *, id: str, access_token: str, refresh_token: str):
 def profile_and_root(tmp_path, monkeypatch):
     """Wire a profile auth store + a distinct global-root auth store on disk.
 
-    The pytest seat belt in ``_write_through_provider_state_to_global_root``
+    The pytest seat belt in ``_guarded_global_root``
     only refuses the *real* user's ``$HOME/.hermes/auth.json``; a tmp_path
     root is allowed, so point HOME away from the tmp root to keep the guard
     from tripping on these fixtures.
@@ -94,6 +94,7 @@ def test_global_write_through_preserves_concurrent_root_update(
                 }
             },
             "credential_pool": {
+                "xai-oauth": [_entry("xai-oauth", id="xai", access_token="old-xai", refresh_token="old-r").to_dict()],
                 "anthropic": [{"id": "anthropic-existing"}],
                 "openrouter": [{"id": "openrouter-existing"}],
             },
@@ -109,7 +110,7 @@ def test_global_write_through_preserves_concurrent_root_update(
 
     def paused_helper_load(path=None):
         store = real_auth_load(path)
-        if threading.current_thread().name == "profile-write-through":
+        if threading.current_thread().name == "profile-write-through" and path == root_path:
             target_holder = A._auth_lock_holder_for(root_path)
             if getattr(target_holder, "depth", 0) > 0:
                 helper_has_target_lock.set()
@@ -123,10 +124,10 @@ def test_global_write_through_preserves_concurrent_root_update(
     monkeypatch.setattr(CP, "_load_auth_store", paused_helper_load)
 
     def profile_write_through():
-        CP._write_through_provider_state_to_global_root(
-            "xai-oauth",
-            {"tokens": {"access_token": "new-xai", "refresh_token": "new-r"}},
-        )
+        entry = _entry("xai-oauth", id="xai", access_token="old-xai", refresh_token="old-r")
+        pool = CredentialPool("xai-oauth", [entry])
+        pool._auth_store_path = root_path
+        pool._refresh_entry(entry, force=True)
 
     def concurrent_codex_login():
         writer_started.set()
@@ -143,6 +144,8 @@ def test_global_write_through_preserves_concurrent_root_update(
             A._save_auth_store(store, target_path=root_path)
         writer_done.set()
 
+    monkeypatch.setattr(CP, "_global_auth_file_path", lambda: root_path)
+    monkeypatch.setattr(A, "refresh_xai_oauth_pure", lambda *args: {"access_token": "new-xai", "refresh_token": "new-r"})
     helper = threading.Thread(target=profile_write_through, name="profile-write-through")
     helper.start()
     assert helper_loaded.wait(timeout=5)
@@ -227,6 +230,7 @@ def test_codex_pool_refresh_holds_auth_store_lock_across_post(monkeypatch, tmp_p
         access_token="stale-access",
         refresh_token="stale-refresh",
     )
+    _write_store(profile_path, {"credential_pool": {provider: [entry.to_dict()]}})
     pool = CredentialPool(provider, [entry])
 
     refreshed = pool._refresh_entry(entry, force=True)
@@ -264,6 +268,7 @@ def test_write_through_fires_on_every_refresh_not_just_first(
                     "tokens": {"access_token": "root-ac", "refresh_token": "root-rf"}
                 }
             },
+            "credential_pool": {"openai-codex": [_entry("openai-codex", id="c1", access_token="root-ac", refresh_token="root-rf").to_dict()]},
         },
     )
 
@@ -272,13 +277,10 @@ def test_write_through_fires_on_every_refresh_not_just_first(
     # credential_pool.py still hold references to the original functions
     # (``from X import Y`` creates a local binding that does not update when
     # ``X.Y`` is reassigned).  Patch CP's bindings separately so the
-    # ``_sync_device_code_entry_to_auth_store`` method — whose __globals__
+    # ``_refresh_entry`` method — whose __globals__
     # are ``agent.credential_pool.__dict__`` — sees the mocked paths.
     monkeypatch.setattr(CP, "_global_auth_file_path", lambda: root_path)
-    monkeypatch.setattr(CP, "_same_path", lambda a, b: a == b)
-    # Let _write_through_provider_state_to_global_root run for real so it
-    # persists the rotated token pair to the root auth.json — the test
-    # asserts the on-disk values after each refresh.
+    # Exercise the real source transaction and assert both successive commits.
 
     # ---- REFRESH 1 ----
     _write_store(profile_path, {"version": 1})
@@ -286,7 +288,9 @@ def test_write_through_fires_on_every_refresh_not_just_first(
         provider, id="c1", access_token="ac1", refresh_token="rf1"
     )
     pool1 = CredentialPool(provider, [entry1])
-    pool1._sync_device_code_entry_to_auth_store(entry1)
+    pool1._auth_store_path = root_path
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", lambda *args: {"access_token": "ac1", "refresh_token": "rf1"})
+    pool1._refresh_entry(_entry(provider, id="c1", access_token="root-ac", refresh_token="root-rf"), force=True)
 
     # Verify root was updated with the rotated tokens from refresh 1.
     root_store = _read_store(root_path)
@@ -306,10 +310,12 @@ def test_write_through_fires_on_every_refresh_not_just_first(
 
     # ---- REFRESH 2 (same scenario, rotated tokens) ----
     entry2 = _entry(
-        provider, id="c2", access_token="ac2", refresh_token="rf2"
+        provider, id="c1", access_token="ac2", refresh_token="rf2"
     )
     pool2 = CredentialPool(provider, [entry2])
-    pool2._sync_device_code_entry_to_auth_store(entry2)
+    pool2._auth_store_path = root_path
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", lambda *args: {"access_token": "ac2", "refresh_token": "rf2"})
+    pool2._refresh_entry(_entry(provider, id="c1", access_token="ac1", refresh_token="rf1"), force=True)
 
     # Verify root was updated with the rotated tokens from refresh 2.
     # The old key-presence check would have silently skipped this write.

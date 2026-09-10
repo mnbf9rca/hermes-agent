@@ -72,7 +72,7 @@ from hermes_cli.auth_minimax import (  # noqa: F401  re-exported
     resolve_minimax_oauth_runtime_credentials)
 from hermes_cli.auth_xai import (  # noqa: F401  re-exported
     _login_xai_oauth, _read_xai_oauth_tokens, _refresh_xai_oauth_tokens, _save_xai_oauth_tokens,
-    _write_through_xai_oauth_to_global_root, _xai_access_token_is_expiring,
+    _xai_access_token_is_expiring,
     _xai_oauth_device_code_login, _xai_oauth_discovery, _xai_oauth_poll_device_token,
     _xai_oauth_request_device_code, _xai_proactive_refresh_skew_seconds,
     _xai_validate_inference_base_url, refresh_xai_oauth_pure, resolve_xai_oauth_runtime_credentials)
@@ -772,10 +772,19 @@ def _load_provider_state_with_source(
     Refresh paths that rotate single-use OAuth refresh tokens must write the updated chain back to
     the same store they read."""
     state = _provider_state_in(auth_store, provider_id)
-    if state is not None:
+    tokens = (state or {}).get("tokens")
+    # Empty post-quarantine shadows inherit usable root state for every reader
+    # (including status/logout), while retaining local diagnostics without a usable fallback.
+    tokenless = provider_id in {"openai-codex", "xai-oauth"} and isinstance(tokens, dict) and not any(
+        tokens.get(key) for key in ("access_token", "refresh_token"))
+    if state is not None and not tokenless:
         return state, _auth_file_path()
     global_state = _provider_state_in(_load_global_auth_store(), provider_id)
-    return (global_state, _global_auth_file_path()) if global_state is not None else (None, None)
+    global_tokens = (global_state or {}).get("tokens")
+    if global_state is not None and (not tokenless or (isinstance(global_tokens, dict) and any(
+            global_tokens.get(key) for key in ("access_token", "refresh_token")))):
+        return global_state, _global_auth_file_path()
+    return (state, _auth_file_path()) if state is not None else (None, None)
 
 
 def _load_provider_state(auth_store: Dict[str, Any], provider_id: str) -> Optional[Dict[str, Any]]:
@@ -784,19 +793,49 @@ def _load_provider_state(auth_store: Dict[str, Any], provider_id: str) -> Option
     return _load_provider_state_with_source(auth_store, provider_id)[0]
 
 
+def _check_oauth_rotation(provider: str, tokens: Dict[str, Any], source_path: Optional[Path]) -> None:
+    """Never lease a pair whose successful rotation could not be committed (#98245)."""
+    from agent.anthropic_credentials import is_rotation_consumed_uncommitted
+
+    if any(is_rotation_consumed_uncommitted(tokens.get(key), source_path=source_path)
+           for key in ("access_token", "refresh_token")):
+        raise AuthError(
+            "OAuth rotation was not durably saved. Run `hermes auth` to re-authenticate.",
+            provider=provider, code="credential_persist_failed", relogin_required=True,
+        )
+
+
 @contextmanager
-def _provider_state_transaction(provider_id: str):
+def _oauth_rotation_commit(provider: str, previous_tokens: Dict[str, Any], source_path: Optional[Path]):
+    """Record a lost rotation at its authority before surfacing a failed save."""
+    try:
+        yield
+    except Exception as exc:
+        from agent.anthropic_credentials import mark_rotation_consumed_uncommitted
+
+        mark_rotation_consumed_uncommitted(
+            previous_tokens.get("access_token"), previous_tokens.get("refresh_token"),
+            source_path=source_path or _auth_file_path(),
+        )
+        raise AuthError(
+            "OAuth rotation was not durably saved. Run `hermes auth` to re-authenticate.",
+            provider=provider, code="credential_persist_failed", relogin_required=True,
+        ) from exc
+
+
+@contextmanager
+def _provider_state_transaction(provider_id: str, *, timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
     """Lock the active auth store and any global fallback source, in that order.
 
     Re-reading the source after its lock is acquired prevents stale refreshes and whole-file lost
     updates without inverting the documented auth -> shared lock order."""
-    with _auth_store_lock():
+    with _auth_store_lock(timeout_seconds=timeout_seconds):
         auth_store = _load_auth_store()
         state, source_path = _load_provider_state_with_source(auth_store, provider_id)
         if source_path is None or _same_path(source_path, _auth_file_path()):
             yield auth_store, state, source_path
             return
-        with _auth_store_lock(target_path=source_path):
+        with _auth_store_lock(target_path=source_path, timeout_seconds=timeout_seconds):
             yield auth_store, _provider_state_in(_load_auth_store(source_path), provider_id), source_path
 
 

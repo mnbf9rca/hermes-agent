@@ -73,9 +73,9 @@ def test_refresh_uses_target_grant_and_preserves_sibling(monkeypatch, status):
             assert target.get("last_error_reset_at") is None
             assert target["last_status"] == "ok"
         else:
-            # Manual grants remain in the pool on terminal failure; only
-            # singleton-seeded grants are removed by the existing quarantine.
-            assert target["last_status"] == "exhausted"
+            # A terminal rejection is durable and quarantines only this grant.
+            assert target["last_status"] == ("dead" if status == 401 else "exhausted")
+            assert target["last_status_at"] is not None
             assert target["access_token"] == before[1]["access_token"]
     finally:
         server.shutdown()

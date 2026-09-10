@@ -34,8 +34,6 @@ class CredentialPoolAdminMixin:
         disk-recency merge reads a cleared ``last_status_at`` (None -> epoch 0)
         as a stale snapshot and would copy a still-binding cooldown back.
         """
-        from agent.credential_pool import _CLEAR_STATUS
-
         with self._lock:
             stale = [
                 e for e in self._entries
@@ -111,7 +109,7 @@ class CredentialPoolAdminMixin:
             return None, None, f'No credential matching "{raw}".'
 
     def add_entry(self, entry: PooledCredential) -> PooledCredential:
-        from agent.credential_pool import _next_priority, write_credential_pool
+        from agent.credential_pool import _next_priority, auth_mod, write_credential_pool
 
         with self._lock:
             entry = replace(entry, priority=_next_priority(self._entries))
@@ -126,6 +124,7 @@ class CredentialPoolAdminMixin:
                 self._entries = [e for e in self._entries if e.id not in borrowed_ids]
                 write_credential_pool(self.provider, [e.to_dict() for e in self._entries])
                 self._borrowed_root_ids = set()
+                self._auth_store_path = auth_mod._auth_file_path()
             else:
                 self._persist()
             return entry
